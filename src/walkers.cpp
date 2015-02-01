@@ -1,11 +1,14 @@
 #include "walkers.h"
 
 #include "jsonhelp.h"
+#include "util.h"
+#include "enums.h"
 
 #include <sstream>
 #include <iomanip>
 #include <cmath>
 #include <utility>
+#include <algorithm>
 
 #include <iostream>
 
@@ -28,11 +31,64 @@ void writeSequence(std::ostream& out, ItType begin, ItType end, const std::strin
 
 std::string bytesAsString(const unsigned char* idBeg, const unsigned char* idEnd) {
   std::stringstream buf;
+  buf.width(2);
+  buf.fill('0');
   buf << std::hex;
-  for (const unsigned char* cur = idBeg; cur < idEnd; ++cur) {
-    buf << std::hex << (unsigned int)*cur;
+  for (const unsigned char* cur = idBeg; cur != idEnd; ++cur) {
+    buf << static_cast<int>(*cur);
   }
   return buf.str();
+}
+/*************************************************************************/
+
+std::string appendVarint(const std::string& base, const unsigned int val) {
+  unsigned char encoded[9];
+  auto bytes = vintEncode(encoded, val);
+  std::string ret(base);
+  ret += bytesAsString(encoded, encoded + bytes);
+  return ret;
+}
+
+std::string makeFileID(const unsigned int level, const std::string& parentID, const int dirIndex) {
+  std::string ret(appendVarint("", level));
+  ret += parentID;
+  if (dirIndex > -1) {
+    ret = appendVarint(ret, dirIndex);
+  }
+  return ret;
+}
+
+DirInfo::DirInfo():
+  Path(""), BareID(""), Level(0), Count(0) {}
+
+DirInfo DirInfo::newChild(const std::string &path) {
+  uint32_t childLvl = childLevel();
+  DirInfo  ret;
+  ret.Path = path;
+  ret.BareID = appendVarint(BareID, Count - 1);
+//  ret.BareID = appendVarint(BareID, Count);
+  ret.Level = childLvl;
+  return ret;
+}
+
+std::string DirInfo::id() const {
+  std::string ret(appendVarint("", Level));
+  ret += BareID;
+  return ret;
+}
+
+std::string DirInfo::lastChild() const {
+  return makeFileID(childLevel(), BareID, Count - 1);
+}
+
+uint32_t DirInfo::childLevel() const {
+  // if ID is null, then we are the dummy root
+  // root doesn't have a level; its children are at level 0
+  return BareID.empty() ? 0: Level + 1;
+}
+
+void DirInfo::incCount() {
+  ++Count;
 }
 /*************************************************************************/
 
@@ -75,6 +131,56 @@ std::string j(const std::weak_ptr< Volume >& vol) {
     buf << "}";
   }
   return buf.str();
+}
+/*************************************************************************/
+
+uint8_t LbtTskAuto::start() {
+  return findFilesInImg();
+}
+
+std::shared_ptr<Image> LbtTskAuto::getImage(const std::vector<std::string>& files) const {
+  return Image::wrap(m_img_info, files, false);
+}
+/*************************************************************************/
+
+std::ostream& operator<<(std::ostream& out, const Image& img) {
+  out << "{";
+
+  out << j(std::string("files")) << ":[";
+  writeSequence(out, img.files().begin(), img.files().end(), ", ");
+  out << "]"
+      << j("description", img.desc())
+      << j("size", img.size())
+      << j("sectorSize", img.sectorSize());
+  out.flush();
+  // std::cerr << "heyo" << std::endl;
+
+  if (std::shared_ptr<VolumeSystem> vs = img.volumeSystem().lock()) {
+    out << "," << j("volumeSystem") << ":{"
+        << j("type", vs->type(), true)
+        << j("description", vs->desc())
+        << j("blockSize", vs->blockSize())
+        << j("numVolumes", vs->numVolumes())
+        << j("offset", vs->offset());
+
+    if (vs->numVolumes()) {
+      out << "," << j(std::string("volumes")) << ":[";
+      writeSequence(out, vs->volBegin(), vs->volEnd(), ",");
+      out << "]";
+    }
+    else {
+      std::cerr << "Image has volume system, but no volumes" << std::endl;
+    }
+    out << "}";
+  }
+  else if (std::shared_ptr<Filesystem> fs = img.filesystem().lock()) {
+    outputFS(out, fs);
+  }
+  else {
+    std::cerr << "Image had neither a volume system nor a filesystem" << std::endl;
+  }
+  out << "}" << std::endl;
+  return out;
 }
 /*************************************************************************/
 
@@ -167,7 +273,7 @@ ssize_t physicalSize(const TSK_FS_FILE* file) {
 }
 
 MetadataWriter::MetadataWriter(std::ostream& out):
-  FileCounter(out), Fs(0), PhysicalSize(-1), DataWritten(0), InUnallocated(false), UCMode(NONE)
+  FileCounter(out), Fs(0), NumUnallocated(0), DiskSize(0), DataWritten(0), SectorSize(0), NumVols(0), InUnallocated(false), UCMode(NONE)
 {
   DummyFile.name = &DummyName;
   DummyFile.meta = &DummyMeta;
@@ -210,7 +316,7 @@ MetadataWriter::MetadataWriter(std::ostream& out):
   DummyMeta.crtime_nano = 0;
   DummyMeta.ctime = 0;
   DummyMeta.ctime_nano = 0;
-  DummyMeta.flags = TSK_FS_META_FLAG_UNALLOC;
+  DummyMeta.flags = (TSK_FS_META_FLAG_ENUM)(TSK_FS_META_FLAG_UNALLOC | TSK_FS_META_FLAG_USED);
   DummyMeta.gid = 0;
   DummyMeta.link = 0;
   DummyMeta.mode = TSK_FS_META_MODE_ENUM(0);
@@ -224,12 +330,22 @@ MetadataWriter::MetadataWriter(std::ostream& out):
   DummyMeta.time2.ext2.dtime_nano = 0;
   DummyMeta.type = TSK_FS_META_TYPE_VIRT;
   DummyMeta.uid = 0;  
+  Dirs.emplace_back(DirInfo());
+}
+
+uint8_t MetadataWriter::start() {
+  DiskSize = m_img_info->size;
+  SectorSize = m_img_info->sector_size;
+  return LbtTskAuto::start();
 }
 
 std::string getPartName(const TSK_VS_PART_INFO* vs_part) {
   std::stringstream buf;
   if (vs_part->flags & TSK_VS_PART_FLAG_ALLOC) {
     buf << "part-" << (int)vs_part->table_num << "-" << (int)vs_part->slot_num;
+  }
+  else if (vs_part->flags & TSK_VS_PART_FLAG_META) {
+    buf << "meta-part@" << vs_part->start;
   }
   else {
     buf << "unused@" << vs_part->start;
@@ -239,16 +355,16 @@ std::string getPartName(const TSK_VS_PART_INFO* vs_part) {
 
 TSK_FILTER_ENUM MetadataWriter::filterVol(const TSK_VS_PART_INFO* vs_part) {
   PartitionName.clear();
+  Part = vs_part;
 
   std::string partName(getPartName(vs_part));
+  std::stringstream buf;
+  buf << vs_part->addr;
+  std::string partID(buf.str());
 
-  if (!InUnallocated &&
-     (VolMode & vs_part->flags) &&
-     ((VolMode & TSK_VS_PART_FLAG_META) || (0 == (vs_part->flags & TSK_VS_PART_FLAG_META))))
-  {
-    DirCounts.clear();
-    DirCounts.push_back(std::make_pair("", vs_part->addr));
-
+  Dirs.resize(1);
+  if (!InUnallocated) {
+    ++NumVols;
     TSK_FS_INFO fs; // we'll make image & volume system look like an fs, sort of
                     // fs.partName will be empty, since we're not _in_ a partition
     const TSK_VS_INFO* vs = vs_part->vs;
@@ -258,50 +374,56 @@ TSK_FILTER_ENUM MetadataWriter::filterVol(const TSK_VS_PART_INFO* vs_part) {
     fs.duname = "sector";
     fs.endian = vs->endian;
     fs.first_block = 0;
-    fs.first_inum = 0;
+    fs.first_inum = 1;
     fs.flags = TSK_FS_INFO_FLAG_NONE;
     fs.fs_id_used = 0;
     fs.ftype = TSK_FS_TYPE_UNSUPP;
     fs.img_info = vs->img_info;
-    fs.inum_count = 1;
+    fs.inum_count = vs->part_count;
     fs.journ_inum = 0;
+    fs.block_count = m_img_info->sector_size > 0 ? m_img_info->size / m_img_info->sector_size: 0;
     fs.last_block = fs.last_block_act = fs.block_count - 1;
-    fs.last_inum = 0;
+    fs.last_inum = vs->part_count;
     fs.list_inum_named = 0;
     fs.offset = 0;
     fs.orphan_dir = 0;
-    fs.root_inum = 0;
-    setFsInfoStr(&fs);
+    fs.root_inum = 1;
+    setFsInfo(&fs, fs.first_block, fs.first_block + fs.block_count);
 
     DummyFile.fs_info = &fs;
 
     DummyAttrRun.addr = vs_part->start;
     DummyAttrRun.len = vs_part->len;
+    DummyAttrRun.offset = 0;
     DummyMeta.size = DummyAttr.size = DummyAttr.nrd.allocsize = DummyAttrRun.len * fs.block_size;
+    
+    DummyName.meta_addr = DummyMeta.addr = NumVols;
 
     // std::cerr << "name = " << name << std::endl;
     DummyName.name = DummyName.shrt_name = const_cast<char*>(partName.c_str());
     DummyName.name_size = DummyName.shrt_name_size = partName.size();
 
 //    std::cerr << "processing " << CurDir << name << std::endl;
-    processUnallocatedFile(&DummyFile, DummyAttr.size);
+    processFile(&DummyFile, "");
 //    std::cerr << "done processing" << std::endl;
   }
   PartitionName = partName;
+  Dirs.emplace_back(Dirs.back().newChild(PartitionName + "/"));
   return TSK_FILTER_CONT;
 }
 
 TSK_FILTER_ENUM MetadataWriter::filterFs(TSK_FS_INFO *fs) {
-  setFsInfoStr(fs);
-  Fs = fs;
+  using namespace boost::icl;
+  setFsInfo(fs, Part ? Part->start: 0, Part ? Part->start + Part->len: m_img_info->size / m_img_info->sector_size);
 
   if (InUnallocated) {
+    for (unsigned i = 0; i < NumRootEntries[FsID]; ++i) {
+      Dirs.back().incCount();
+    }
     flushUnallocated();
     return TSK_FILTER_SKIP;
   }
   else {
-    UnallocatedRuns[FsID] += boost::icl::discrete_interval<uint64>::right_open(0, fs->block_count);
-    CurUnallocatedItr = UnallocatedRuns.find(FsID);
     return TSK_FILTER_CONT;
   }
 }
@@ -313,7 +435,7 @@ void MetadataWriter::startUnallocated() {
   }
 }
 
-void MetadataWriter::setFsInfoStr(TSK_FS_INFO* fs) {
+void MetadataWriter::setFsInfo(TSK_FS_INFO* fs, uint64_t startSector, uint64_t endSector) {
   FsID = bytesAsString(fs->fs_id, &fs->fs_id[fs->fs_id_used]);
   std::stringstream buf;
   buf << j(std::string("fs")) << ":{"
@@ -323,34 +445,55 @@ void MetadataWriter::setFsInfoStr(TSK_FS_INFO* fs) {
       << j("partName", PartitionName)
       << "}";
   FsInfo = buf.str();
+  Fs = fs; // does not take ownership
+  CurAllocatedItr = AllocatedRuns.find(FsID);
+  if (AllocatedRuns.end() == CurAllocatedItr) {
+    CurAllocatedItr = AllocatedRuns.insert(std::make_pair(FsID,
+                        std::make_tuple(fs->block_size, startSector, endSector, FsMap{}))).first;
+  }
+}
+
+bool MetadataWriter::atFSRootLevel(const std::string& path) const {
+  return path.size() == PartitionName.size() + 1 && path.back() == '/';
 }
 
 void MetadataWriter::setCurDir(const char* path) {
-  std::string p(path);
-  auto rItr(DirCounts.rbegin());
-  while (rItr != DirCounts.rend()) {
-    if (rItr->first == p) {
-      break;
-    }
-    ++rItr;
+  std::string p;
+  if (!PartitionName.empty()) {
+    p += PartitionName;
+    p += "/";
   }
-  if (rItr == DirCounts.rend()) {
-    DirCounts.push_back(std::make_pair(p, 0));
+  p += path;
+
+  auto rItr = std::find_if(Dirs.rbegin(), Dirs.rend(), [&p](const DirInfo& d){ return d.path() == p; });
+  if (rItr == Dirs.rend()) {
+    // Couldn't find the dir on the stack, so push it on
+    // However, since TSK uses depth-first traversal, we'll have seen the entry for the directory immediately prior,
+    // so we _MUST NOT_ increment the count on Dirs.back(), because then we'd be double-counting.
+    std::cerr << "new directory " << p << std::endl;
+    Dirs.emplace_back(Dirs.back().newChild(p));
   }
   else {
-    DirCounts.resize(rItr.base() - DirCounts.begin()); // === erase(rItr.base(), DirCounts.end())
-    ++DirCounts.back().second;
+    // found it; pop off any children and inc the count
+    std::cerr << "old directory " << p << std::endl;
+    Dirs.erase(rItr.base(), Dirs.end());
   }
+  Dirs.back().incCount();
+  if (atFSRootLevel(p)) {
+    NumRootEntries[FsID] = Dirs.back().count();
+  }
+  std::cerr << "setCurDir(" << path << ") seen, id = " << Dirs.back().id() << ", Count = " << Dirs.back().count()
+    << ", parentID = " << (++Dirs.rbegin() != Dirs.rend() ? (++Dirs.rbegin())->id(): "") << std::endl;
 }
 
 TSK_RETVAL_ENUM MetadataWriter::processFile(TSK_FS_FILE* file, const char* path) {
+  std::cerr << "processFile on " << path << file->name->name << std::endl;
   setCurDir(path);
   // std::cerr << "beginning callback" << std::endl;
   try {
     if (file) {
-      PhysicalSize = physicalSize(file);
       std::stringstream buf;
-      writeFile(buf, file, PhysicalSize);
+      writeFile(buf, file);
       std::string output(buf.str());
       Out << output << '\n';
       DataWritten += output.size();
@@ -367,71 +510,43 @@ TSK_RETVAL_ENUM MetadataWriter::processFile(TSK_FS_FILE* file, const char* path)
 void MetadataWriter::finishWalk() {
 }
 
-void writeMetaRecord(std::ostream& out, const TSK_FS_META* i, const TSK_FS_INFO* fs) {
+void MetadataWriter::writeMetaRecord(std::ostream& out, const TSK_FS_FILE* file, const TSK_FS_INFO* fs) {
+  const TSK_FS_META* i = file->meta;
+
   out << "{"
-      << j("addr", i->addr, true)
-      << j("atime", i->atime)
+      << j<int64_t>("addr", static_cast<int64_t>(i->addr), true)
+      << j("accessed", formatTimestamp(i->atime, i->atime_nano))
       << j("content_len", i->content_len)
-      << j("crtime", i->crtime)
-      << j("ctime", i->ctime)
-      << j("flags", i->flags)
+      << j("created", formatTimestamp(i->crtime, i->crtime_nano))
+      << j("metadata", formatTimestamp(i->ctime, i->ctime_nano))
+      << j("flags", metaFlags(i->flags))
       << j("gid", i->gid);
   if (i->link) {
     out << j("link", std::string(i->link));
   }
   if (TSK_FS_TYPE_ISEXT(fs->ftype)) {
-    out << j("dtime", i->time2.ext2.dtime);
+    out << j("dtime", formatTimestamp(i->time2.ext2.dtime, i->time2.ext2.dtime_nano));
   }
   else if (TSK_FS_TYPE_ISHFS(fs->ftype)) {
-    out << j("bkup_time", i->time2.hfs.bkup_time);
+    out << j("bkup_time", formatTimestamp(i->time2.hfs.bkup_time, i->time2.hfs.bkup_time_nano));
   }
   out << j("mode", i->mode)
-      << j("mtime", i->mtime)
+      << j("modified", formatTimestamp(i->mtime, i->mtime_nano))
       << j("nlink", i->nlink)
       << j("seq", i->seq)
       << j("size", i->size)
-      << j("type", i->type)
-      << j("uid", i->uid)
-      << "}";
-}
-
-void writeDummyNameRecord(std::ostream& out, const TSK_FS_NAME* n, unsigned int dirIndex) {
-  out << "{"
-      << j("flags", n->flags, true)
-      << j("meta_addr", n->meta_addr)
-      << j("meta_seq", n->meta_seq)
-      << j("name", (n->name && n->name_size ? std::string(n->name): ""))
-      << j("shrt_name", (n->shrt_name && n->shrt_name_size ? std::string(n->shrt_name): ""))
-      << j("type", n->type)
-      << j("dirIndex", dirIndex)
-      << "}";
-}
-
-void MetadataWriter::writeFile(std::ostream& out, const TSK_FS_FILE* file, uint64 physicalSize) {
-  out << "{" << FsInfo
-      << j("path", DirCounts.back().first)
-      << j("physicalSize", physicalSize);
-
-  TSK_FS_META* m = file->meta;
-  if (m && (m->flags & TSK_FS_META_FLAG_USED)) {
-    out << ", \"meta\":";
-    writeMetaRecord(out, m, file->fs_info);
-  }
-  if (file->name) {
-    TSK_FS_NAME* n = file->name;
-    out << ", \"name\":";
-    writeDummyNameRecord(out, n, DirCounts.back().second);
-  }
+      << j("type", metaType(i->type))
+      << j("uid", i->uid);
 
   out << ", \"attrs\":[";
-  if (file->meta && (file->meta->attr_state & TSK_FS_META_ATTR_STUDIED) && file->meta->attr) {
+  if ((i->attr_state & TSK_FS_META_ATTR_STUDIED) && i->attr) {
     const TSK_FS_ATTR* lastAttr = 0;
-    for (const TSK_FS_ATTR* a = file->meta->attr->head; a; a = a->next) {
+    for (const TSK_FS_ATTR* a = i->attr->head; a; a = a->next) {
       if (a->flags & TSK_FS_ATTR_INUSE) {
         if (lastAttr != 0) {
           out << ", ";
         }
-        writeAttr(out, a, file->meta->flags & TSK_FS_META_FLAG_ALLOC);
+        writeAttr(out, i->addr, a);
         lastAttr = a;
       }
     }
@@ -440,13 +555,13 @@ void MetadataWriter::writeFile(std::ostream& out, const TSK_FS_FILE* file, uint6
     int numAttrs = tsk_fs_file_attr_getsize(const_cast<TSK_FS_FILE*>(file));
     if (numAttrs > 0) {
       unsigned int num = 0;
-      for (int i = 0; i < numAttrs; ++i) {
-        const TSK_FS_ATTR* a = tsk_fs_file_attr_get_idx(const_cast<TSK_FS_FILE*>(file), i);
+      for (int j = 0; j < numAttrs; ++j) {
+        const TSK_FS_ATTR* a = tsk_fs_file_attr_get_idx(const_cast<TSK_FS_FILE*>(file), j);
         if (a) {
           if (num > 0) {
             out << ", ";
           }
-          writeAttr(out, a, file->meta->flags & TSK_FS_META_FLAG_ALLOC);
+          writeAttr(out, i->addr, a);
           ++num;
         }
       }
@@ -456,9 +571,44 @@ void MetadataWriter::writeFile(std::ostream& out, const TSK_FS_FILE* file, uint6
   out << "}";
 }
 
-void MetadataWriter::writeAttr(std::ostream& out, const TSK_FS_ATTR* a, const bool isAllocated) {
+void MetadataWriter::writeNameRecord(std::ostream& out, const TSK_FS_NAME* n) {
   out << "{"
-      << j("flags", a->flags, true)
+      << j("flags", nameFlags(n->flags), true)
+      << j<int64_t>("meta_addr", static_cast<int64_t>(n->meta_addr))
+      << j("meta_seq", n->meta_seq)
+      << j("name", (n->name && n->name_size ? std::string(n->name): ""))
+      << j("shrt_name", (n->shrt_name && n->shrt_name_size ? std::string(n->shrt_name): ""))
+      << j("type", nameType(n->type))
+      << "}";
+}
+
+void MetadataWriter::writeFile(std::ostream& out, const TSK_FS_FILE* file) {
+  DirInfo fileDirEnt(Dirs.back().newChild(""));
+
+  out << "{" << j("id", fileDirEnt.id(), true)
+      << j("parent", Dirs.back().id())
+      << j("children", fileDirEnt.lastChild())
+      << ", \"t\":{ \"fsmd\":{ ";
+
+  out << FsInfo
+      << j("path", Dirs.back().path());
+
+  if (file->name) {
+    TSK_FS_NAME* n = file->name;
+    out << ", \"name\":";
+    writeNameRecord(out, n);
+  }
+  TSK_FS_META* m = file->meta;
+  if (m && (m->flags & TSK_FS_META_FLAG_USED)) {
+    out << ", \"meta\":";
+    writeMetaRecord(out, file, file->fs_info);
+  }
+  out << "} } }";
+}
+
+void MetadataWriter::writeAttr(std::ostream& out, TSK_INUM_T addr, const TSK_FS_ATTR* a) {
+  out << "{"
+      << j("flags", attrFlags(a->flags), true)
       << j("id", a->id)
       << j("name", a->name ? std::string(a->name): std::string(""))
       << j("size", a->size)
@@ -483,11 +633,52 @@ void MetadataWriter::writeAttr(std::ostream& out, const TSK_FS_ATTR* a, const bo
 
   if (a->flags & TSK_FS_ATTR_NONRES && a->nrd.run) {
     out << ", \"nrd_runs\":[";
+    uint64_t fo = 0; // file offset
+    uint64_t slackFo = 0;
+    uint64_t skipBytes = a->nrd.skiplen; // up from 32 bits to 64 for convenience
     for (TSK_FS_ATTR_RUN* curRun = a->nrd.run; curRun; curRun = curRun->next) {
-      if (isAllocated) {
-        markAllocated(extent(curRun->addr, curRun->addr + curRun->len));
+      if (TSK_FS_ATTR_RUN_FLAG_FILLER == curRun->flags) {
+        // TO-DO: check on the exact semantics of this flag
+        continue;
       }
+      // normal case - make absolute offsets
+      uint64_t beg = (curRun->addr * Fs->block_size) + Fs->offset,
+               runEnd = beg + (curRun->len * Fs->block_size),
+               end = runEnd;
+      bool     trueSlack = false;
 
+      // if skipping, advance beg and decrement skipBytes accordingly
+      if (skipBytes > 0) { // still towards beginning where skiplen is > 0
+        uint64_t toSkip = std::min(end - beg, skipBytes);
+        beg += toSkip;
+        skipBytes -= toSkip;
+      }
+      if (beg < end) { // past skipping, we're onto data
+        uint64_t bytesRemaining = a->size - fo; // how much data left in file stream?
+        if (beg + bytesRemaining < end) {
+          end = beg + bytesRemaining; // end is now beginning of true slack
+          trueSlack = true;
+        }
+        if (beg < end) { // if false, we're fully into true slack, nothing of file left
+          if (TSK_FS_ATTR_RUN_FLAG_SPARSE == curRun->flags) {
+            // if run is sparse, then underlying data goes to slack stream, so we
+            // advance slackFo. But primary fo must also be advanced, too.
+            markDataRun(beg, end, slackFo, addr, a->id, true);
+            slackFo += (end - beg);
+          }
+          else {
+            // just normal data
+            markDataRun(beg, end, fo, addr, a->id, false);
+          }
+          fo += (end - beg);
+        }
+        if (trueSlack) {
+          // mark slack at end of allocated space
+          markDataRun(end, runEnd, slackFo, addr, a->id, true);
+          slackFo += (runEnd - end);
+        }
+      }
+      // output data run as json
       if (curRun != a->nrd.run) {
         out << ", ";
       }
@@ -503,84 +694,95 @@ void MetadataWriter::writeAttr(std::ostream& out, const TSK_FS_ATTR* a, const bo
   out << "}";
 }
 
-void MetadataWriter::markAllocated(const extent& allocated) {
-  if (allocated.first < allocated.second && allocated.second <= Fs->block_count) {
-    CurUnallocatedItr->second -= boost::icl::discrete_interval<uint64>::right_open(allocated.first, allocated.second);    
+void MetadataWriter::markDataRun(uint64_t beg, uint64_t end, uint64_t offset, TSK_INUM_T addr, uint32_t attrID, bool slack) {
+  if (beg < end) {
+    std::get<3>(CurAllocatedItr->second) += std::make_pair(
+      boost::icl::discrete_interval<uint64_t>::right_open(beg, end),
+      AttrSet{{AttrRunInfo{addr, attrID, slack, beg, offset}}}
+    );
   }
 }
 
-void MetadataWriter::processUnallocatedFile(TSK_FS_FILE* file, uint64 physicalSize) {
+bool MetadataWriter::makeUnallocatedDataRun(TSK_DADDR_T start, TSK_DADDR_T end, TSK_FS_ATTR_RUN& datarun) {
+  if (start < end) {
+    datarun.addr = start;
+    datarun.len = end - start;
+    datarun.offset = 0;
+    return true;
+  }
+  return false;
+}
+
+void MetadataWriter::prepUnallocatedFile(unsigned int fieldWidth, unsigned int blockSize, std::string& name,
+                                         TSK_FS_ATTR_RUN& run, TSK_FS_ATTR& attr, TSK_FS_META& meta, TSK_FS_NAME& nameRec)
+{
   std::stringstream buf;
-  writeFile(buf, file, physicalSize);
-  const std::string output(buf.str());
-  Out << output << '\n';
-  DataWritten += output.size();
-  FileCounter::processFile(file, DirCounts.back().first.c_str());
+  buf << std::setw(fieldWidth) << std::setfill('0')
+    << run.addr << "-" << run.len;
+  name = buf.str();
+  // std::cerr << "name = " << name << std::endl;
+  nameRec.name = nameRec.shrt_name = const_cast<char*>(name.c_str());
+  nameRec.name_size = nameRec.shrt_name_size = name.size();
+
+  meta.size = attr.size = attr.nrd.allocsize = run.len * blockSize;
+
+  nameRec.meta_addr = meta.addr = std::numeric_limits<uint64_t>::max() - run.addr;
+}
+
+void MetadataWriter::processUnallocatedFragment(TSK_DADDR_T start, TSK_DADDR_T end, unsigned int fieldWidth, std::string& name) {
+  std::string path("$Unallocated/");
+  if (makeUnallocatedDataRun(start, end, DummyAttrRun)) {
+    if (BLOCK == UCMode) {
+      for (TSK_DADDR_T cur(start); cur != end; ++cur) {
+        makeUnallocatedDataRun(cur, cur + 1, DummyAttrRun);
+        prepUnallocatedFile(fieldWidth, Fs->block_size, name, DummyAttrRun, DummyAttr, DummyMeta, DummyName);
+        processFile(&DummyFile, path.c_str());
+      }
+    }
+    else {
+      makeUnallocatedDataRun(start, end, DummyAttrRun);
+      prepUnallocatedFile(fieldWidth, Fs->block_size, name, DummyAttrRun, DummyAttr, DummyMeta, DummyName);
+      processFile(&DummyFile, path.c_str());
+    }
+  }
 }
 
 void MetadataWriter::flushUnallocated() {
   if (!Fs || UCMode == NONE) {
     return;
   }
-  setCurDir("$Unallocated/");
-
   DummyFile.fs_info = Fs;
 
+  // throw out an entry for the folder, and then reset fields for being files
+  std::string name = "$Unallocated";
+  DummyName.meta_addr = 0;
+  DummyName.name = DummyName.shrt_name = const_cast<char*>(name.c_str());
+  DummyName.name_size = DummyName.shrt_name_size = name.size();
+  DummyName.par_addr = Fs->root_inum;
+  DummyName.par_seq = 0;
+  DummyName.type = TSK_FS_NAME_TYPE_DIR;
+  DummyMeta.flags = TSK_FS_META_FLAG_UNUSED;
+  processFile(&DummyFile, "");
+  DummyName.type = TSK_FS_NAME_TYPE_VIRT;
+  DummyName.par_addr = DummyName.meta_addr;
+  DummyMeta.flags = TSK_FS_META_FLAG_USED;
+
   const unsigned int fieldWidth = std::log10(Fs->block_count) + 1;
-  std::string  name;
 
   const std::string fsID(bytesAsString(Fs->fs_id, &Fs->fs_id[Fs->fs_id_used]));
 
+  TSK_DADDR_T start = (Fs->first_block * Fs->block_size) + Fs->offset;
+
 //  std::cerr << "processing unallocated" << std::endl;
-  // uint num = UnallocatedRuns.size();
-  // for (auto unallocated: UnallocatedRuns) {
-  //   ++num;
-  // }
-//  std::cerr << num << " unallocated fragments" << std::endl;
-  const auto& unallocated = UnallocatedRuns[fsID];
-  for (decltype(unallocated.begin()) it(unallocated.begin()); it != unallocated.end(); ++it) {
-    auto unallocated = *it;
-    // std::cerr << "got here" << std::endl;
-    // std::cerr << "run [" << unallocated.lower() << ", " << unallocated.upper() << ")" << std::endl;
-
-    if (FRAGMENT == UCMode) {
-      DummyAttrRun.addr = unallocated.lower();
-      DummyAttrRun.len = unallocated.upper() - DummyAttrRun.addr;
-      DummyMeta.size = DummyAttr.size = DummyAttr.nrd.allocsize = DummyAttrRun.len * Fs->block_size;
-      std::stringstream buf;
-      buf << std::setw(fieldWidth) << std::setfill('0')
-        << DummyAttrRun.addr << "-" << DummyAttrRun.len;
-      name = buf.str();
-      // std::cerr << "name = " << name << std::endl;
-      DummyName.name = DummyName.shrt_name = const_cast<char*>(name.c_str());
-      DummyName.name_size = DummyName.shrt_name_size = std::strlen(DummyName.name);
-
-  //    std::cerr << "processing " << CurDir << name << std::endl;
-      processUnallocatedFile(&DummyFile, DummyAttr.size);
-  //    std::cerr << "done processing" << std::endl;
-
-      ++DirCounts.back().second;
-    }
-    else if (BLOCK == UCMode) {
-      DummyAttrRun.len = 1;
-      DummyMeta.size = DummyAttr.size = DummyAttr.nrd.allocsize = DummyAttrRun.len * Fs->block_size;
-      for (auto cur = unallocated.lower(); cur < unallocated.upper(); ++cur) {
-        DummyAttrRun.addr = cur;
-        std::stringstream buf;
-        buf << std::setw(fieldWidth) << std::setfill('0') << DummyAttrRun.addr;
-        name = buf.str();
-        // std::cerr << "name = " << name << std::endl;
-        DummyName.name = DummyName.shrt_name = const_cast<char*>(name.c_str());
-        DummyName.name_size = DummyName.shrt_name_size = std::strlen(DummyName.name);
-
-    //    std::cerr << "processing " << CurDir << name << std::endl;
-        processUnallocatedFile(&DummyFile, DummyAttr.size);
-    //    std::cerr << "done processing" << std::endl;
-
-        ++DirCounts.back().second;
-      }
-    }
+  const auto& partition = std::get<3>(AllocatedRuns[fsID]);
+  // iterate over the allocated extents
+  // start is the end of the last allocated extent, end is the beginning of the next,
+  // so we need to do one more round after the loop completes
+  for (auto nextFrag(partition.begin()); nextFrag != partition.end(); ++nextFrag) {
+    processUnallocatedFragment((start - Fs->offset) / Fs->block_size, (nextFrag->first.lower() - Fs->offset) / Fs->block_size, fieldWidth, name);
+    start = nextFrag->first.upper();
   }
+  processUnallocatedFragment((start - Fs->offset) / Fs->block_size, Fs->last_block, fieldWidth, name);
 //  std::cerr << "done processing unallocated" << std::endl;
 
   // Out << "[";
@@ -592,81 +794,81 @@ void MetadataWriter::flushUnallocated() {
 FileWriter::FileWriter(std::ostream& out):
   MetadataWriter(out), Buffer(1024 * 1024, 0) {}
 
-void FileWriter::writeMetadata(const TSK_FS_FILE* file, uint64 physicalSize) {
-  std::stringstream buf;
-  writeFile(buf, file, physicalSize);
-  const std::string output(buf.str());
+void FileWriter::writeMetadata(const TSK_FS_FILE*) {
+  // std::stringstream buf;
+  // writeFile(buf, file, physicalSize);
+  // const std::string output(buf.str());
 
-  uint64 size = output.size();
-  Out.write((const char*)&size, sizeof(size));
-  Out.write(output.data(), size);
+  // uint64 size = output.size();
+  // Out.write((const char*)&size, sizeof(size));
+  // Out.write(output.data(), size);
 
-  DataWritten += sizeof(size);
-  DataWritten += output.size();
+  // DataWritten += sizeof(size);
+  // DataWritten += output.size();
 }
 
-TSK_RETVAL_ENUM FileWriter::processFile(TSK_FS_FILE* file, const char* path) {
-  std::string fp(path);
-  fp += std::string(file->name->name);
-  //std::cerr << "processing " << fp << std::endl;
-  setCurDir(path);
-  PhysicalSize = physicalSize(file);
-  writeMetadata(file, PhysicalSize);
+TSK_RETVAL_ENUM FileWriter::processFile(TSK_FS_FILE*, const char*) {
+  // std::string fp(path);
+  // fp += std::string(file->name->name);
+  // //std::cerr << "processing " << fp << std::endl;
+  // setCurDir(path);
+  // // PhysicalSize = physicalSize(file);
+  // writeMetadata(file);
 
-  uint64 size = PhysicalSize == -1 ? 0: PhysicalSize,
-         cur  = 0;
-  // std::cerr << "writing " << fp << ", size = " << size << std::endl;
-  Out.write((const char*)&size, sizeof(size));
-  DataWritten += sizeof(size);
+  // uint64 size = PhysicalSize == -1 ? 0: PhysicalSize,
+  //        cur  = 0;
+  // // std::cerr << "writing " << fp << ", size = " << size << std::endl;
+  // Out.write((const char*)&size, sizeof(size));
+  // DataWritten += sizeof(size);
 
-  while (cur < size) {
-    ssize_t toRead = std::min(size - cur, (uint64)Buffer.size());
-    if (toRead == tsk_fs_file_read(file, cur, &Buffer[0], toRead, TSK_FS_FILE_READ_FLAG_SLACK)) {
-      Out.write(&Buffer[0], toRead);
-      cur += toRead;
-    }
-    else {
-      throw std::runtime_error("Had a problem reading data out of a file");
-    }
-  }
-  DataWritten += cur;
+  // while (cur < size) {
+  //   ssize_t toRead = std::min(size - cur, (uint64)Buffer.size());
+  //   if (toRead == tsk_fs_file_read(file, cur, &Buffer[0], toRead, TSK_FS_FILE_READ_FLAG_SLACK)) {
+  //     Out.write(&Buffer[0], toRead);
+  //     cur += toRead;
+  //   }
+  //   else {
+  //     throw std::runtime_error("Had a problem reading data out of a file");
+  //   }
+  // }
+  // DataWritten += cur;
   // std::cerr << "Done with " << fp << ", DataWritten = " << DataWritten << std::endl;
   //std::cerr << "done processing " << fp << std::endl;
   return TSK_OK;
 }
 
-void FileWriter::processUnallocatedFile(TSK_FS_FILE* file, uint64 physicalSize) {
-  std::string fp(DirCounts.back().first);
-  fp += std::string(file->name->name);
-  // std::cerr << "processing " << fp << std::endl;
+void FileWriter::processUnallocatedFile(TSK_FS_FILE* ) {
+//   std::string fp(DirCounts.back().first);
+//   fp += std::string(file->name->name);
+//   // std::cerr << "processing " << fp << std::endl;
 
-  writeMetadata(file, physicalSize);
+//   writeMetadata(file);
 
-  Out.write((const char*)&physicalSize, sizeof(physicalSize));
-  DataWritten += sizeof(physicalSize);
+//   Out.write((const char*)&physicalSize, sizeof(physicalSize));
+//   DataWritten += sizeof(physicalSize);
 
-  uint64 bytesToWrite = 0;
-  auto bytes = Fs->block_size;
+//   uint64 bytesToWrite = 0;
+//   auto bytes = Fs->block_size;
 
-  for (auto run = file->meta->attr->head->nrd.run; run; run = run->next) {
-    auto blockOffset = run->addr;
-    auto endBlock = run->addr + run->len;
-    while (blockOffset < endBlock) {
-//      auto toRead = std::min(endBlock - blockOffset, maxBlocks);
-      if (bytes == tsk_fs_read_block(Fs, blockOffset, &Buffer[0], bytes)) {
-        Out.write(&Buffer[0], bytes);
-        ++blockOffset;
-        bytesToWrite += bytes;
-        // std::cerr << "wrote block " << blockOffset << std::endl;
-      }
-    }
-  }
-  DataWritten += bytesToWrite;
-  if (bytesToWrite != physicalSize) {
-    std::stringstream buf;
-    buf << "Did not write out expected amount of unallocated data for " << file->name->name << 
-      ". Physical size: " << physicalSize << ", Bytes Written: " << bytesToWrite;
-    throw std::runtime_error(buf.str());
-  }
-  // std::cerr << "done processing " << fp << std::endl;
+//   for (auto run = file->meta->attr->head->nrd.run; run; run = run->next) {
+//     auto blockOffset = run->addr;
+//     auto endBlock = run->addr + run->len;
+//     while (blockOffset < endBlock) {
+// //      auto toRead = std::min(endBlock - blockOffset, maxBlocks);
+//       if (bytes == tsk_fs_read_block(Fs, blockOffset, &Buffer[0], bytes)) {
+//         Out.write(&Buffer[0], bytes);
+//         ++blockOffset;
+//         bytesToWrite += bytes;
+//         // std::cerr << "wrote block " << blockOffset << std::endl;
+//       }
+//     }
+//   }
+//   DataWritten += bytesToWrite;
+//   if (bytesToWrite != physicalSize) {
+//     std::stringstream buf;
+//     buf << "Did not write out expected amount of unallocated data for " << file->name->name << 
+//       ". Physical size: " << physicalSize << ", Bytes Written: " << bytesToWrite;
+//     throw std::runtime_error(buf.str());
+//   }
+//   // std::cerr << "done processing " << fp << std::endl;
 }
