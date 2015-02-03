@@ -12,7 +12,7 @@
 
 #include <iostream>
 
-std::string j(const boost::icl::discrete_interval<uint64>& i) {
+std::string j(const boost::icl::discrete_interval<uint64_t>& i) {
   std::stringstream buf;
   buf << "(" << i.lower() << ", " << i.upper() << ")";
   return buf.str();
@@ -29,16 +29,6 @@ void writeSequence(std::ostream& out, ItType begin, ItType end, const std::strin
   }
 }
 
-std::string bytesAsString(const unsigned char* idBeg, const unsigned char* idEnd) {
-  std::stringstream buf;
-  buf.width(2);
-  buf.fill('0');
-  buf << std::hex;
-  for (const unsigned char* cur = idBeg; cur != idEnd; ++cur) {
-    buf << static_cast<int>(*cur);
-  }
-  return buf.str();
-}
 /*************************************************************************/
 
 std::string appendVarint(const std::string& base, const unsigned int val) {
@@ -46,15 +36,6 @@ std::string appendVarint(const std::string& base, const unsigned int val) {
   auto bytes = vintEncode(encoded, val);
   std::string ret(base);
   ret += bytesAsString(encoded, encoded + bytes);
-  return ret;
-}
-
-std::string makeFileID(const unsigned int level, const std::string& parentID, const int dirIndex) {
-  std::string ret(appendVarint("", level));
-  ret += parentID;
-  if (dirIndex > -1) {
-    ret = appendVarint(ret, dirIndex);
-  }
   return ret;
 }
 
@@ -72,13 +53,20 @@ DirInfo DirInfo::newChild(const std::string &path) {
 }
 
 std::string DirInfo::id() const {
-  std::string ret(appendVarint("", Level));
+  std::string ret(appendVarint("", RecordTypes::FILE));
+  ret = appendVarint(ret, Level);
   ret += BareID;
   return ret;
 }
 
 std::string DirInfo::lastChild() const {
-  return makeFileID(childLevel(), BareID, Count - 1);
+  std::string ret(appendVarint("", RecordTypes::FILE));
+  ret = appendVarint(ret, childLevel());
+  ret += BareID;
+  if (Count > 0) {
+    ret = appendVarint(ret, Count - 1);
+  }
+  return ret;
 }
 
 uint32_t DirInfo::childLevel() const {
@@ -354,7 +342,7 @@ std::string getPartName(const TSK_VS_PART_INFO* vs_part) {
 }
 
 TSK_FILTER_ENUM MetadataWriter::filterVol(const TSK_VS_PART_INFO* vs_part) {
-  PartitionName.clear();
+  VolName.clear();
   Part = vs_part;
 
   std::string partName(getPartName(vs_part));
@@ -363,8 +351,8 @@ TSK_FILTER_ENUM MetadataWriter::filterVol(const TSK_VS_PART_INFO* vs_part) {
   std::string partID(buf.str());
 
   Dirs.resize(1);
+  ++NumVols;
   if (!InUnallocated) {
-    ++NumVols;
     TSK_FS_INFO fs; // we'll make image & volume system look like an fs, sort of
                     // fs.partName will be empty, since we're not _in_ a partition
     const TSK_VS_INFO* vs = vs_part->vs;
@@ -388,7 +376,10 @@ TSK_FILTER_ENUM MetadataWriter::filterVol(const TSK_VS_PART_INFO* vs_part) {
     fs.offset = 0;
     fs.orphan_dir = 0;
     fs.root_inum = 1;
+    uint32_t numVols = NumVols;
+    NumVols = 0; // because NumVols is used as the FS index
     setFsInfo(&fs, fs.first_block, fs.first_block + fs.block_count);
+    NumVols = numVols;
 
     DummyFile.fs_info = &fs;
 
@@ -407,8 +398,8 @@ TSK_FILTER_ENUM MetadataWriter::filterVol(const TSK_VS_PART_INFO* vs_part) {
     processFile(&DummyFile, "");
 //    std::cerr << "done processing" << std::endl;
   }
-  PartitionName = partName;
-  Dirs.emplace_back(Dirs.back().newChild(PartitionName + "/"));
+  VolName = partName;
+  Dirs.emplace_back(Dirs.back().newChild(VolName + "/"));
   return TSK_FILTER_CONT;
 }
 
@@ -417,7 +408,7 @@ TSK_FILTER_ENUM MetadataWriter::filterFs(TSK_FS_INFO *fs) {
   setFsInfo(fs, Part ? Part->start: 0, Part ? Part->start + Part->len: m_img_info->size / m_img_info->sector_size);
 
   if (InUnallocated) {
-    for (unsigned i = 0; i < NumRootEntries[FsID]; ++i) {
+    for (unsigned i = 0; i < NumRootEntries[NumVols]; ++i) {
       Dirs.back().incCount();
     }
     flushUnallocated();
@@ -442,25 +433,26 @@ void MetadataWriter::setFsInfo(TSK_FS_INFO* fs, uint64_t startSector, uint64_t e
       << j("byteOffset", fs->offset, true)
       << j("blockSize", fs->block_size)
       << j("fsID", FsID)
-      << j("partName", PartitionName)
+      << j("volName", VolName)
+      << j("volIndex", NumVols)
       << "}";
   FsInfo = buf.str();
   Fs = fs; // does not take ownership
-  CurAllocatedItr = AllocatedRuns.find(FsID);
+  CurAllocatedItr = AllocatedRuns.find(NumVols);
   if (AllocatedRuns.end() == CurAllocatedItr) {
-    CurAllocatedItr = AllocatedRuns.insert(std::make_pair(FsID,
+    CurAllocatedItr = AllocatedRuns.insert(std::make_pair(NumVols,
                         std::make_tuple(fs->block_size, startSector, endSector, FsMap{}))).first;
   }
 }
 
 bool MetadataWriter::atFSRootLevel(const std::string& path) const {
-  return path.size() == PartitionName.size() + 1 && path.back() == '/';
+  return path.size() == VolName.size() + 1 && path.back() == '/';
 }
 
 void MetadataWriter::setCurDir(const char* path) {
   std::string p;
-  if (!PartitionName.empty()) {
-    p += PartitionName;
+  if (!VolName.empty()) {
+    p += VolName;
     p += "/";
   }
   p += path;
@@ -470,24 +462,24 @@ void MetadataWriter::setCurDir(const char* path) {
     // Couldn't find the dir on the stack, so push it on
     // However, since TSK uses depth-first traversal, we'll have seen the entry for the directory immediately prior,
     // so we _MUST NOT_ increment the count on Dirs.back(), because then we'd be double-counting.
-    std::cerr << "new directory " << p << std::endl;
+    // std::cerr << "new directory " << p << std::endl;
     Dirs.emplace_back(Dirs.back().newChild(p));
   }
   else {
     // found it; pop off any children and inc the count
-    std::cerr << "old directory " << p << std::endl;
+    // std::cerr << "old directory " << p << std::endl;
     Dirs.erase(rItr.base(), Dirs.end());
   }
   Dirs.back().incCount();
   if (atFSRootLevel(p)) {
-    NumRootEntries[FsID] = Dirs.back().count();
+    NumRootEntries[NumVols] = Dirs.back().count();
   }
-  std::cerr << "setCurDir(" << path << ") seen, id = " << Dirs.back().id() << ", Count = " << Dirs.back().count()
-    << ", parentID = " << (++Dirs.rbegin() != Dirs.rend() ? (++Dirs.rbegin())->id(): "") << std::endl;
+  // std::cerr << "setCurDir(" << path << ") seen, id = " << Dirs.back().id() << ", Count = " << Dirs.back().count()
+  //   << ", parentID = " << (++Dirs.rbegin() != Dirs.rend() ? (++Dirs.rbegin())->id(): "") << std::endl;
 }
 
 TSK_RETVAL_ENUM MetadataWriter::processFile(TSK_FS_FILE* file, const char* path) {
-  std::cerr << "processFile on " << path << file->name->name << std::endl;
+  // std::cerr << "processFile on " << path << file->name->name << std::endl;
   setCurDir(path);
   // std::cerr << "beginning callback" << std::endl;
   try {
@@ -512,7 +504,6 @@ void MetadataWriter::finishWalk() {
 
 void MetadataWriter::writeMetaRecord(std::ostream& out, const TSK_FS_FILE* file, const TSK_FS_INFO* fs) {
   const TSK_FS_META* i = file->meta;
-
   out << "{"
       << j<int64_t>("addr", static_cast<int64_t>(i->addr), true)
       << j("accessed", formatTimestamp(i->atime, i->atime_nano))
@@ -583,9 +574,10 @@ void MetadataWriter::writeNameRecord(std::ostream& out, const TSK_FS_NAME* n) {
 }
 
 void MetadataWriter::writeFile(std::ostream& out, const TSK_FS_FILE* file) {
-  DirInfo fileDirEnt(Dirs.back().newChild(""));
+  DirInfo     fileDirEnt(Dirs.back().newChild(""));
+  std::string id(fileDirEnt.id());
 
-  out << "{" << j("id", fileDirEnt.id(), true)
+  out << "{" << j("id", id, true)
       << j("parent", Dirs.back().id())
       << j("children", fileDirEnt.lastChild())
       << ", \"t\":{ \"fsmd\":{ ";
@@ -602,8 +594,16 @@ void MetadataWriter::writeFile(std::ostream& out, const TSK_FS_FILE* file) {
   if (m && (m->flags & TSK_FS_META_FLAG_USED)) {
     out << ", \"meta\":";
     writeMetaRecord(out, file, file->fs_info);
+
+    ReverseMap[NumVols][file->meta->addr].emplace_back(id);
+
+    out << "}, \"__link\":\"" << makeInodeID(NumVols, file->meta->addr) << "\"";
   }
-  out << "} } }";
+  else {
+    out << "}";
+  }
+
+  out << " } }";
 }
 
 void MetadataWriter::writeAttr(std::ostream& out, TSK_INUM_T addr, const TSK_FS_ATTR* a) {
@@ -636,6 +636,7 @@ void MetadataWriter::writeAttr(std::ostream& out, TSK_INUM_T addr, const TSK_FS_
     uint64_t fo = 0; // file offset
     uint64_t slackFo = 0;
     uint64_t skipBytes = a->nrd.skiplen; // up from 32 bits to 64 for convenience
+    bool first = true;
     for (TSK_FS_ATTR_RUN* curRun = a->nrd.run; curRun; curRun = curRun->next) {
       if (TSK_FS_ATTR_RUN_FLAG_FILLER == curRun->flags) {
         // TO-DO: check on the exact semantics of this flag
@@ -660,17 +661,11 @@ void MetadataWriter::writeAttr(std::ostream& out, TSK_INUM_T addr, const TSK_FS_
           trueSlack = true;
         }
         if (beg < end) { // if false, we're fully into true slack, nothing of file left
-          if (TSK_FS_ATTR_RUN_FLAG_SPARSE == curRun->flags) {
-            // if run is sparse, then underlying data goes to slack stream, so we
-            // advance slackFo. But primary fo must also be advanced, too.
-            markDataRun(beg, end, slackFo, addr, a->id, true);
-            slackFo += (end - beg);
-          }
-          else {
-            // just normal data
+          if (TSK_FS_ATTR_RUN_FLAG_NONE == curRun->flags) {
+            // just normal data; sparse blocks will be made available as unallocated
             markDataRun(beg, end, fo, addr, a->id, false);
           }
-          fo += (end - beg);
+          fo += (end - beg); // advances fo even if data run is sparse, which is critical
         }
         if (trueSlack) {
           // mark slack at end of allocated space
@@ -679,7 +674,7 @@ void MetadataWriter::writeAttr(std::ostream& out, TSK_INUM_T addr, const TSK_FS_
         }
       }
       // output data run as json
-      if (curRun != a->nrd.run) {
+      if (!first) {
         out << ", ";
       }
       out << "{"
@@ -688,6 +683,7 @@ void MetadataWriter::writeAttr(std::ostream& out, TSK_INUM_T addr, const TSK_FS_
           << j("len", curRun->len)
           << j("offset", curRun->offset)
           << "}";
+      first = false;
     }
     out << "]";
   }
@@ -769,12 +765,10 @@ void MetadataWriter::flushUnallocated() {
 
   const unsigned int fieldWidth = std::log10(Fs->block_count) + 1;
 
-  const std::string fsID(bytesAsString(Fs->fs_id, &Fs->fs_id[Fs->fs_id_used]));
-
   TSK_DADDR_T start = (Fs->first_block * Fs->block_size) + Fs->offset;
 
 //  std::cerr << "processing unallocated" << std::endl;
-  const auto& partition = std::get<3>(AllocatedRuns[fsID]);
+  const auto& partition = std::get<3>(AllocatedRuns[NumVols]);
   // iterate over the allocated extents
   // start is the end of the last allocated extent, end is the beginning of the next,
   // so we need to do one more round after the loop completes

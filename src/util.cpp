@@ -5,6 +5,9 @@
 #include <sstream>
 #include <iomanip>
 
+#include "enums.h"
+#include "jsonhelp.h"
+
 template<unsigned int N>
 inline void writeBigEndian(const uint64_t val, unsigned char* buf) {
   constexpr unsigned int maskShift = (N - 1) * 8;
@@ -147,3 +150,53 @@ std::string formatTimestamp(uint32_t unix, uint32_t ns) {
   }
   return ret;
 }
+
+std::string bytesAsString(const unsigned char* idBeg, const unsigned char* idEnd) {
+  std::stringstream buf;
+  unsigned short val;
+  for (const unsigned char* cur = idBeg; cur < idEnd; ++cur) {
+    val = *cur;
+    buf.width(2);
+    buf.fill('0');
+    buf << std::hex;
+    buf << val;
+  }
+  return buf.str();
+}
+
+std::string makeInodeID(uint32_t volIndex, uint64_t inum) {
+  std::stringstream buf;
+  buf.width(2);
+  buf.fill('0');
+  buf << std::hex << RecordTypes::INODE;
+  buf.width(2 * sizeof(volIndex));
+  buf.fill('0');
+  buf << std::hex << volIndex;
+  buf.width(2 * sizeof(inum));
+  buf.fill('0');
+  buf << std::hex << inum;
+  return buf.str();
+}
+
+std::string makeDiskMapID(uint64_t offset) {
+  std::stringstream buf;
+  buf.width(2);
+  buf.fill('0');
+  buf << std::hex << RecordTypes::DISK_MAP;
+  buf.width(2 * sizeof(offset));
+  buf.fill('0');
+  buf << offset;
+  return buf.str();
+}
+
+std::string j(const std::string& x) {
+  std::string s("\"");
+  s += x;
+  s += "\"";
+  return s;
+}
+
+// template<>
+// std::string j<char>(const char* x) {
+//   return j(std::string(x));
+// }

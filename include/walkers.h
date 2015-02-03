@@ -8,8 +8,6 @@
 
 std::ostream& operator<<(std::ostream& out, const Image& img);
 
-std::string makeFileID(const unsigned int level, const std::string& parentID, const int dirIndex);
-
 struct Extent {
   std::string FileID,
               StreamID;
@@ -116,7 +114,10 @@ public:
   typedef std::set<AttrRunInfo> AttrSet;
   typedef boost::icl::interval_map<uint64_t, AttrSet> FsMap;
   typedef std::tuple<uint32_t, uint64_t, uint64_t, FsMap> FsMapInfo;
-  typedef std::map<std::string, FsMapInfo> DiskMap;
+  typedef std::map<uint32_t, FsMapInfo> DiskMap; // FS index as key
+
+  // FS index -> inode -> [IDs]
+  typedef std::map<uint32_t, std::map<uint64_t, std::vector<std::string>>> ReverseInodeMapType;
 
   MetadataWriter(std::ostream& out);
 
@@ -136,6 +137,7 @@ public:
   virtual void finishWalk();
 
   const DiskMap& diskMap() const { return AllocatedRuns; }
+  const ReverseInodeMapType& reverseMap() const { return ReverseMap; }
 
   uint64_t diskSize() const { return DiskSize; }
   uint32_t sectorSize() const { return SectorSize; }
@@ -146,7 +148,7 @@ protected:
   const TSK_VS_PART_INFO* Part;
   TSK_FS_INFO*      Fs;
 
-  std::string PartitionName;
+  std::string VolName;
 
   uint64_t    NumUnallocated,
               DiskSize;
@@ -158,9 +160,11 @@ protected:
 
   UNALLOCATED_HANDLING UCMode;
 
-  DiskMap AllocatedRuns; // FS ID->interval->inodes
-  std::map< std::string, unsigned int > NumRootEntries;
+  DiskMap AllocatedRuns; // FS index->interval->inodes
+  std::map<uint32_t, unsigned int> NumRootEntries; // FS index->count
   decltype(AllocatedRuns.begin()) CurAllocatedItr;
+
+  ReverseInodeMapType ReverseMap;
 
   void setCurDir(const char* path);
   void setFsInfo(TSK_FS_INFO* fs, uint64_t startSector, uint64_t endSector);
