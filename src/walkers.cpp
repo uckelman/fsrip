@@ -322,11 +322,11 @@ MetadataWriter::MetadataWriter(std::ostream& out):
 }
 
 uint8_t MetadataWriter::start() {
-  // set PartBeg and PartEnd in case there isn't a partition scheme
-  PartBeg = 0;
-  PartEnd = DiskSize = m_img_info->size;
+  DiskSize = m_img_info->size;
   SectorSize = m_img_info->sector_size;
   NumVols = 0;
+  // set PartBeg and PartEnd in case there isn't a partition scheme
+  resetPartitionRange();
   return LbtTskAuto::start();
 }
 
@@ -359,9 +359,9 @@ TSK_FILTER_ENUM MetadataWriter::filterVol(const TSK_VS_PART_INFO* vs_part) {
     TSK_FS_INFO fs; // we'll make image & volume system look like an fs, sort of
                     // fs.partName will be empty, since we're not _in_ a partition
     const TSK_VS_INFO* vs = vs_part->vs;
-    fs.block_count = (vs->img_info->size / vs->block_size);
+    fs.block_count = (vs->img_info->size / vs->img_info->sector_size);
     fs.block_post_size = fs.block_pre_size = 0;
-    fs.block_size = fs.dev_bsize = vs->block_size;
+    fs.block_size = fs.dev_bsize = vs->img_info->sector_size;
     fs.duname = "sector";
     fs.endian = vs->endian;
     fs.first_block = 0;
@@ -372,7 +372,6 @@ TSK_FILTER_ENUM MetadataWriter::filterVol(const TSK_VS_PART_INFO* vs_part) {
     fs.img_info = vs->img_info;
     fs.inum_count = vs->part_count;
     fs.journ_inum = 0;
-    fs.block_count = m_img_info->sector_size > 0 ? m_img_info->size / m_img_info->sector_size: 0;
     fs.last_block = fs.last_block_act = fs.block_count - 1;
     fs.last_inum = vs->part_count;
     fs.list_inum_named = 0;
@@ -381,6 +380,7 @@ TSK_FILTER_ENUM MetadataWriter::filterVol(const TSK_VS_PART_INFO* vs_part) {
     fs.root_inum = 1;
     uint32_t numVols = NumVols;
     NumVols = 0; // because NumVols is used as the FS index
+    resetPartitionRange(); // since we're talking about the dummy root FS
     setFsInfo(&fs, fs.first_block, fs.first_block + fs.block_count);
     NumVols = numVols;
 
@@ -401,8 +401,8 @@ TSK_FILTER_ENUM MetadataWriter::filterVol(const TSK_VS_PART_INFO* vs_part) {
     processFile(&DummyFile, "");
 //    std::cerr << "done processing" << std::endl;
   }
-  PartBeg = std::min(vs_part->start * m_img_info->sector_size, DiskSize);
-  PartEnd = std::min((vs_part->start * vs_part->len) * m_img_info->sector_size, DiskSize);
+  setPartitionRange(std::min(vs_part->start * SectorSize, DiskSize),
+                    std::min((vs_part->start * vs_part->len) * SectorSize, DiskSize));
   VolName = partName;
   Dirs.emplace_back(Dirs.back().newChild(VolName + "/"));
   return TSK_FILTER_CONT;
@@ -484,6 +484,16 @@ void MetadataWriter::setCurDir(const char* path) {
   // std::cerr << "setCurDir(" << path << ") seen, id = " << Dirs.back().id() << ", Count = " << Dirs.back().count()
   //   << ", parentID = " << (++Dirs.rbegin() != Dirs.rend() ? (++Dirs.rbegin())->id(): "") << std::endl;
 }
+
+void MetadataWriter::resetPartitionRange() {
+  setPartitionRange(0, DiskSize);
+}
+
+void MetadataWriter::setPartitionRange(uint64_t begin, uint64_t end) {
+  PartBeg = begin;
+  PartEnd = end;
+}
+
 
 TSK_RETVAL_ENUM MetadataWriter::processFile(TSK_FS_FILE* file, const char* path) {
   // std::cerr << "processFile on " << path << file->name->name << std::endl;
@@ -580,6 +590,22 @@ void MetadataWriter::writeNameRecord(std::ostream& out, const TSK_FS_NAME* n) {
       << "}";
 }
 
+bool typeMatch(const TSK_FS_NAME_TYPE_ENUM n, const TSK_FS_META_TYPE_ENUM m) {
+  // because why have one enum for the type when you can have two different lists
+  // of the same elements?
+  return (n == TSK_FS_NAME_TYPE_FIFO && m == TSK_FS_META_TYPE_FIFO) ||
+         (n == TSK_FS_NAME_TYPE_CHR && m == TSK_FS_META_TYPE_CHR) ||
+         (n == TSK_FS_NAME_TYPE_DIR && m == TSK_FS_META_TYPE_DIR) ||
+         (n == TSK_FS_NAME_TYPE_BLK && m == TSK_FS_META_TYPE_BLK) ||
+         (n == TSK_FS_NAME_TYPE_REG && m == TSK_FS_META_TYPE_REG) ||
+         (n == TSK_FS_NAME_TYPE_LNK && m == TSK_FS_META_TYPE_LNK) ||
+         (n == TSK_FS_NAME_TYPE_SOCK && m == TSK_FS_META_TYPE_SOCK) ||
+         (n == TSK_FS_NAME_TYPE_SHAD && m == TSK_FS_META_TYPE_SHAD) ||
+         (n == TSK_FS_NAME_TYPE_WHT && m == TSK_FS_META_TYPE_WHT) ||
+         (n == TSK_FS_NAME_TYPE_VIRT && m == TSK_FS_META_TYPE_VIRT) ||
+         (n == TSK_FS_NAME_TYPE_UNDEF); // no meta type for this, so give it the pedantic benefit of the doubt
+}
+
 void MetadataWriter::writeFile(std::ostream& out, const TSK_FS_FILE* file) {
   DirInfo     fileDirEnt(Dirs.back().newChild(""));
   std::string id(fileDirEnt.id());
@@ -592,13 +618,17 @@ void MetadataWriter::writeFile(std::ostream& out, const TSK_FS_FILE* file) {
   out << FsInfo
       << j("path", Dirs.back().path());
 
+  TSK_FS_NAME* n = nullptr;
   if (file->name) {
-    TSK_FS_NAME* n = file->name;
+    n = file->name;
     out << ", \"name\":";
     writeNameRecord(out, n);
   }
   TSK_FS_META* m = file->meta;
-  if (m && (m->flags & TSK_FS_META_FLAG_USED)) {
+  if (m && // gotta have a pointer
+     (m->flags & TSK_FS_META_FLAG_USED) && // gotta be legit
+     (!n || n->flags & TSK_FS_NAME_FLAG_ALLOC || typeMatch(n->type, m->type))) // no sense in outputting meta if file's deleted and name and meta types don't match
+  {
     out << ", \"meta\":";
     writeMetaRecord(out, file, file->fs_info);
 
