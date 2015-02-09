@@ -322,7 +322,9 @@ MetadataWriter::MetadataWriter(std::ostream& out):
 }
 
 uint8_t MetadataWriter::start() {
-  DiskSize = m_img_info->size;
+  // set PartBeg and PartEnd in case there isn't a partition scheme
+  PartBeg = 0;
+  PartEnd = DiskSize = m_img_info->size;
   SectorSize = m_img_info->sector_size;
   NumVols = 0;
   return LbtTskAuto::start();
@@ -399,6 +401,8 @@ TSK_FILTER_ENUM MetadataWriter::filterVol(const TSK_VS_PART_INFO* vs_part) {
     processFile(&DummyFile, "");
 //    std::cerr << "done processing" << std::endl;
   }
+  PartBeg = std::min(vs_part->start * m_img_info->sector_size, DiskSize);
+  PartEnd = std::min((vs_part->start * vs_part->len) * m_img_info->sector_size, DiskSize);
   VolName = partName;
   Dirs.emplace_back(Dirs.back().newChild(VolName + "/"));
   return TSK_FILTER_CONT;
@@ -439,6 +443,8 @@ void MetadataWriter::setFsInfo(TSK_FS_INFO* fs, uint64_t startSector, uint64_t e
       << "}";
   FsInfo = buf.str();
   Fs = fs; // does not take ownership
+  FSBeg = PartBeg;
+  FSEnd = PartEnd;
   CurAllocatedItr = AllocatedRuns.find(NumVols);
   if (AllocatedRuns.end() == CurAllocatedItr) {
     CurAllocatedItr = AllocatedRuns.insert(std::make_pair(NumVols,
@@ -692,6 +698,8 @@ void MetadataWriter::writeAttr(std::ostream& out, TSK_INUM_T addr, const TSK_FS_
 }
 
 void MetadataWriter::markDataRun(uint64_t beg, uint64_t end, uint64_t offset, TSK_INUM_T addr, uint32_t attrID, bool slack) {
+  beg = std::max(beg, FSBeg); // just in case
+  end = std::min(end, FSEnd);
   if (beg < end) {
     std::get<3>(CurAllocatedItr->second) += std::make_pair(
       boost::icl::discrete_interval<uint64_t>::right_open(beg, end),
@@ -752,17 +760,20 @@ void MetadataWriter::flushUnallocated() {
 
   // throw out an entry for the folder, and then reset fields for being files
   std::string name = "$Unallocated";
-  DummyName.meta_addr = 0;
+  DummyName.meta_addr = std::numeric_limits<uint64_t>::max();
+  DummyName.meta_seq = 0;
   DummyName.name = DummyName.shrt_name = const_cast<char*>(name.c_str());
   DummyName.name_size = DummyName.shrt_name_size = name.size();
   DummyName.par_addr = Fs->root_inum;
   DummyName.par_seq = 0;
   DummyName.type = TSK_FS_NAME_TYPE_DIR;
-  DummyMeta.flags = TSK_FS_META_FLAG_UNUSED;
+  DummyName.flags = TSK_FS_NAME_FLAG_ALLOC;
+  DummyMeta.flags = TSK_FS_META_FLAG_UNUSED; // will cause meta to be omitted
   processFile(&DummyFile, "");
   DummyName.type = TSK_FS_NAME_TYPE_VIRT;
   DummyName.par_addr = DummyName.meta_addr;
-  DummyMeta.flags = TSK_FS_META_FLAG_USED;
+  DummyMeta.flags = (TSK_FS_META_FLAG_ENUM)(TSK_FS_META_FLAG_USED | TSK_FS_META_FLAG_UNALLOC);
+  DummyMeta.type = TSK_FS_META_TYPE_VIRT;
 
   const unsigned int fieldWidth = std::log10(Fs->block_count) + 1;
 
