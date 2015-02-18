@@ -261,7 +261,8 @@ ssize_t physicalSize(const TSK_FS_FILE* file) {
 }
 
 MetadataWriter::MetadataWriter(std::ostream& out):
-  FileCounter(out), Fs(0), NumUnallocated(0), DiskSize(0), DataWritten(0), SectorSize(0), NumVols(0), InUnallocated(false), UCMode(NONE)
+  FileCounter(out), Fs(0), NumUnallocated(0), DiskSize(0), MaxUnallocatedBlockSize(std::numeric_limits<uint64_t>::max()),
+  DataWritten(0), SectorSize(0), NumVols(0), InUnallocated(false), UCMode(NONE)
 {
   DummyFile.name = &DummyName;
   DummyFile.meta = &DummyMeta;
@@ -761,7 +762,7 @@ void MetadataWriter::prepUnallocatedFile(unsigned int fieldWidth, unsigned int b
   nameRec.name = nameRec.shrt_name = const_cast<char*>(name.c_str());
   nameRec.name_size = nameRec.shrt_name_size = name.size();
 
-  meta.size = attr.size = attr.nrd.allocsize = run.len * blockSize;
+  meta.size = attr.size = attr.nrd.initsize = attr.nrd.allocsize = run.len * blockSize;
 
   nameRec.meta_addr = meta.addr = std::numeric_limits<uint64_t>::max() - run.addr;
 }
@@ -777,9 +778,15 @@ void MetadataWriter::processUnallocatedFragment(TSK_DADDR_T start, TSK_DADDR_T e
       }
     }
     else {
-      makeUnallocatedDataRun(start, end, DummyAttrRun);
-      prepUnallocatedFile(fieldWidth, Fs->block_size, name, DummyAttrRun, DummyAttr, DummyMeta, DummyName);
-      processFile(&DummyFile, path.c_str());
+      const uint64_t maxBlocks = MaxUnallocatedBlockSize == std::numeric_limits<uint64_t>::max() ? end - start: MaxUnallocatedBlockSize;
+      for (TSK_DADDR_T cur = start; cur < end; cur += maxBlocks) {
+        makeUnallocatedDataRun(cur, std::min(cur + maxBlocks, end), DummyAttrRun);
+        prepUnallocatedFile(fieldWidth, Fs->block_size, name, DummyAttrRun, DummyAttr, DummyMeta, DummyName);
+        processFile(&DummyFile, path.c_str());
+      }
+      // makeUnallocatedDataRun(start, end, DummyAttrRun);
+      // prepUnallocatedFile(fieldWidth, Fs->block_size, name, DummyAttrRun, DummyAttr, DummyMeta, DummyName);
+      // processFile(&DummyFile, path.c_str());
     }
   }
 }
